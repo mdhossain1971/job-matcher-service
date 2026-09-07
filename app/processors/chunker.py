@@ -6,7 +6,13 @@ from dataclasses import dataclass, field
 import re
 import logging
 
-from app.processors.tokenizer import get_text_processor
+from app.processors.tokenizer import canonicalize_skill, get_text_processor
+from app.processors.skill_groups import (
+    flatten_groups,
+    normalize_jd_text,
+    parse_skill_groups,
+    split_required_preferred,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +26,7 @@ class ProfileChunks:
     education_text: str = ""
     summary_text: str = ""
     full_text: str = ""  # Combined for overall semantic matching
+    qualification_evidence_text: str = ""
     
     # Extracted data
     skills_list: List[str] = field(default_factory=list)
@@ -32,7 +39,8 @@ class ProfileChunks:
             "experience": self.experience_text,
             "education": self.education_text,
             "summary": self.summary_text,
-            "full": self.full_text
+            "full": self.full_text,
+            "qualification_evidence": self.qualification_evidence_text,
         }
 
 
@@ -48,6 +56,7 @@ class JobChunks:
     # Extracted data
     required_skills_list: List[str] = field(default_factory=list)
     preferred_skills_list: List[str] = field(default_factory=list)
+    required_skill_groups: List[List[str]] = field(default_factory=list)
     years_required: Optional[int] = None
     
     def to_dict(self) -> Dict[str, str]:
@@ -101,7 +110,7 @@ class DocumentChunker:
                 proficiency = skill.get("proficiency", "")
                 
                 if name:
-                    skills_list.append(name.lower())
+                    skills_list.append(canonicalize_skill(name))
                     skill_str = name
                     if years:
                         skill_str += f" ({years} years)"
@@ -109,11 +118,11 @@ class DocumentChunker:
                         skill_str += f" [{proficiency}]"
                     skills_parts.append(skill_str)
             elif isinstance(skill, str):
-                skills_list.append(skill.lower())
+                skills_list.append(canonicalize_skill(skill))
                 skills_parts.append(skill)
                 
         chunks.skills_text = "Skills: " + ", ".join(skills_parts) if skills_parts else ""
-        chunks.skills_list = skills_list
+        chunks.skills_list = _dedupe_keep_order(skills_list)
         
         # 2. Experience chunk
         experiences = profile_data.get("experiences", [])
@@ -181,8 +190,9 @@ class DocumentChunker:
             # Extract additional skills from resume
             resume_skills = self.processor.extract_skills(resume_text)
             for skill in resume_skills:
-                if skill.lower() not in chunks.skills_list:
-                    chunks.skills_list.append(skill.lower())
+                canon = canonicalize_skill(skill)
+                if canon and canon not in chunks.skills_list:
+                    chunks.skills_list.append(canon)
             
             # Add to full text
             full_parts.append(f"Resume: {self.processor.clean_text(resume_text)[:1000]}")
@@ -196,6 +206,23 @@ class DocumentChunker:
             chunks.years_experience = self.processor.extract_years_experience(
                 summary or resume_text or ""
             )
+
+        # Qualification evidence: structured profile signal vs job required quals.
+        # Reuses the existing compact experience_text (title/company + truncated
+        # cleaned bullets) so demonstrated responsibilities are present without
+        # concatenating resume_text / full_text (those stay on semantic_match).
+        evidence_parts = []
+        if chunks.years_experience:
+            evidence_parts.append(f"{chunks.years_experience} years of experience")
+        if chunks.summary_text:
+            evidence_parts.append(chunks.summary_text)
+        if chunks.skills_text:
+            evidence_parts.append(chunks.skills_text)
+        if chunks.experience_text:
+            evidence_parts.append(chunks.experience_text)
+        if chunks.education_text:
+            evidence_parts.append(chunks.education_text)
+        chunks.qualification_evidence_text = " ".join(evidence_parts)
             
         return chunks
     
@@ -229,25 +256,43 @@ class DocumentChunker:
         location = job_data.get("location", "")
         remote_type = job_data.get("remote_type", "")
         
-        # 1. Required skills chunk
-        # Extract from skills_required field and from description/requirements
-        all_skills = set()
-        
+        combined_prose = "\n".join(p for p in (description or "", requirements or "") if p)
+        normalized = normalize_jd_text(combined_prose)
+        sections = split_required_preferred(normalized)
+
+        groups = parse_skill_groups(sections.required_text) if sections.required_text else []
+        grouped_skills = {skill for group in groups for skill in group}
+
+        preferred_from_text = set()
+        if sections.preferred_text:
+            preferred_from_text.update(self.processor.extract_skills(sections.preferred_text))
+
+        # skills_required is a lossy flatten of the whole JD (often including
+        # OR alternatives and preferred-only skills). Absorb; do not AND-promote.
         if skills_required:
-            # Parse comma-separated skills
-            for skill in skills_required.split(","):
-                skill = skill.strip().lower()
-                if skill:
-                    all_skills.add(skill)
-                    
-        # Extract skills from description and requirements
-        for text in [description, requirements]:
-            if text:
-                extracted = self.processor.extract_skills(text)
-                all_skills.update(extracted)
-                
-        chunks.required_skills_list = sorted(list(all_skills))
-        chunks.required_skills_text = f"Required Skills: {', '.join(chunks.required_skills_list)}" if all_skills else ""
+            for raw in skills_required.split(","):
+                token = canonicalize_skill(raw)
+                if not token:
+                    continue
+                if token in grouped_skills:
+                    continue
+                if token in preferred_from_text or (
+                    sections.preferred_text and token in sections.preferred_text.lower()
+                ):
+                    preferred_from_text.add(token)
+                    continue
+                if sections.found_required_header and token not in sections.required_text.lower():
+                    continue
+                groups.append([token])
+                grouped_skills.add(token)
+
+        chunks.required_skill_groups = groups
+        chunks.required_skills_list = flatten_groups(groups)
+        chunks.preferred_skills_list = sorted(preferred_from_text)
+        chunks.required_skills_text = (
+            f"Required Skills: {', '.join(chunks.required_skills_list)}"
+            if chunks.required_skills_list else ""
+        )
         
         # 2. Responsibilities chunk (from description)
         if description:
@@ -258,27 +303,21 @@ class DocumentChunker:
                 resp_text = description[:500]  # Use first part of description
             chunks.responsibilities_text = f"Responsibilities: {self.processor.clean_text(resp_text)}"
             
-        # 3. Qualifications chunk (from requirements)
-        qual_parts = []
-        
-        if requirements:
-            qual_parts.append(self.processor.clean_text(requirements))
-            
-        # Add job metadata
-        meta_parts = []
-        if title:
-            meta_parts.append(f"Position: {title}")
-        if company:
-            meta_parts.append(f"Company: {company}")
-        if location:
-            meta_parts.append(f"Location: {location}")
-        if remote_type:
-            meta_parts.append(f"Remote: {remote_type}")
-            
-        if meta_parts:
-            qual_parts.insert(0, " | ".join(meta_parts))
-            
-        chunks.qualifications_text = "Qualifications: " + " ".join(qual_parts) if qual_parts else ""
+        # 3. Qualifications chunk: required-quals text only. No title/company
+        # metadata (those are not qualifications) and no preferred section.
+        qual_source = sections.required_text
+        if not qual_source and requirements:
+            qual_source = normalize_jd_text(requirements)
+        if not qual_source and normalized:
+            resp_slice = self._extract_section(normalized,
+                ["responsibilities", "duties", "what you'll do", "you will", "key responsibilities"])
+            qual_source = normalized
+            if resp_slice:
+                qual_source = normalized.replace(resp_slice, " ", 1)
+        chunks.qualifications_text = (
+            f"Qualifications: {self.processor.clean_text(qual_source)}"
+            if qual_source else ""
+        )
         
         # 4. Full text (for overall semantic matching)
         full_parts = [
@@ -322,6 +361,16 @@ class DocumentChunker:
                     return match.group(1).strip()
                     
         return ""
+
+
+def _dedupe_keep_order(values: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
 
 
 # Global chunker instance

@@ -22,6 +22,27 @@ class TextProcessor:
     NLP text processor for tokenization, lemmatization, and entity extraction.
     """
     
+    # Conservative aliases only. Canonical forms must exist in TECH_SKILLS.
+    # Do not treat related-but-different technologies as equivalent.
+    SKILL_ALIASES = {
+        "go": "golang",
+        "golang": "golang",
+        "go language": "golang",
+        "postgres": "postgresql",
+        "postgresql": "postgresql",
+        "k8s": "kubernetes",
+        "kubernetes": "kubernetes",
+        "rest": "rest",
+        "restful": "rest",
+        "rest services": "rest",
+        "rest api": "rest",
+        "gcp": "gcp",
+        "google cloud": "gcp",
+        "google cloud platform": "gcp",
+        "aws": "aws",
+        "amazon web services": "aws",
+    }
+
     # Common tech skill patterns for extraction
     TECH_SKILLS = {
         # Languages
@@ -167,35 +188,34 @@ class TextProcessor:
             text: Input text
             
         Returns:
-            List of extracted skills (deduplicated, lowercase)
+            List of extracted skills (deduplicated, canonical, lowercase)
         """
         if not text:
             return []
             
         text_lower = text.lower()
         found_skills = set()
+        scan_tokens = set(self.TECH_SKILLS) | set(self.SKILL_ALIASES.keys())
         
-        # Check for each known skill
-        for skill in self.TECH_SKILLS:
-            # Handle multi-word skills
+        # Longer phrases first so "google cloud platform" wins over leftover tokens
+        for skill in sorted(scan_tokens, key=len, reverse=True):
             if ' ' in skill:
                 if skill in text_lower:
-                    found_skills.add(skill)
+                    found_skills.add(canonicalize_skill(skill))
             else:
-                # Word boundary matching for single-word skills
                 pattern = r'\b' + re.escape(skill) + r'\b'
                 if re.search(pattern, text_lower):
-                    found_skills.add(skill)
+                    found_skills.add(canonicalize_skill(skill))
         
         # Also extract capitalized abbreviations (AWS, GCP, API, etc.)
         abbreviations = re.findall(r'\b[A-Z]{2,6}\b', text)
         for abbr in abbreviations:
             abbr_lower = abbr.lower()
-            if abbr_lower in self.TECH_SKILLS:
-                found_skills.add(abbr_lower)
+            if abbr_lower in scan_tokens:
+                found_skills.add(canonicalize_skill(abbr_lower))
                 
-        return sorted(list(found_skills))
-    
+        return sorted(found_skills)
+
     def extract_years_experience(self, text: str) -> Optional[int]:
         """
         Extract years of experience from text.
@@ -312,6 +332,14 @@ class TextProcessor:
             all_stops = basic_stops | self.CUSTOM_STOP_WORDS
             tokens = [t for t in tokens if t not in all_stops and len(t) > 1]
         return tokens
+
+
+def canonicalize_skill(name: str) -> str:
+    """Map a skill spelling to its canonical form. Case-insensitive."""
+    if not name:
+        return ""
+    key = name.strip().lower()
+    return TextProcessor.SKILL_ALIASES.get(key, key)
 
 
 # Global processor instance (lazy-loaded)

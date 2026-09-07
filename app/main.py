@@ -95,6 +95,7 @@ app.add_middleware(
 # Include routers
 app.include_router(health.router)
 app.include_router(embed.router)
+app.include_router(embed.similarity_router)
 app.include_router(match.router)
 
 
@@ -111,7 +112,8 @@ async def root():
             "embed_job": "POST /api/v1/embed/job",
             "match": "POST /api/v1/match",
             "match_inline": "POST /api/v1/match/inline",
-            "find_similar": "GET /api/v1/match/similar-jobs/{profile_id}"
+            "find_similar": "GET /api/v1/match/similar-jobs/{profile_id}",
+            "similarity": "POST /api/v1/similarity"
         }
     }
 

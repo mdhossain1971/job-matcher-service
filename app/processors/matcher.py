@@ -153,7 +153,7 @@ class MatchingEngine:
         # 4. Requirements Fit (10%)
         requirements_score, req_analysis = self._compute_requirements_fit(
             profile.chunks, job.chunks,
-            profile.embeddings.get("education"),
+            profile.embeddings.get("qualification_evidence"),
             job.embeddings.get("qualifications")
         )
         
@@ -177,8 +177,9 @@ class MatchingEngine:
             logger.info(f"  " + "-" * 40)
             logger.info(f"  Weighted Sum:      {final_score:5.1f}")
         
-        # PENALTY: Cap score if NO skills match
-        if len(matched_skills) == 0 and len(job.chunks.required_skills_list) > 0:
+        # PENALTY: Cap score if NO required skill groups are satisfied
+        required_groups = _skill_groups(job.chunks)
+        if len(matched_skills) == 0 and len(required_groups) > 0:
             cap = settings.zero_skill_match_cap
             if final_score > cap:
                 logger.warning(f"  PENALTY: Zero skill match -> Capping {final_score:.1f} to {cap}")
@@ -229,35 +230,50 @@ class MatchingEngine:
         job_skill_emb: Optional[np.ndarray]
     ) -> Tuple[float, List[str], List[str], Dict]:
         """
-        Compute skill match score.
-        
-        Strategy:
-        - 70% weight on exact matches
-        - 30% weight on semantic similarity
-        - If NO exact matches, cap at 50% (semantic alone can't save you)
+        Compute skill match score against required skill groups.
+
+        A group is satisfied if any alternative is in the profile set.
+        Unused alternatives from a satisfied group are not missing skills.
+        Unsatisfied OR-group alternatives are listed in missing_skills for
+        backward compatibility; they are alternatives within one group, not
+        independent required skills.
         """
         details = {}
         
         profile_skills = set(s.lower() for s in profile_chunks.skills_list)
-        job_skills = set(s.lower() for s in job_chunks.required_skills_list)
+        groups = _skill_groups(job_chunks)
         
         logger.debug(f"Profile skills ({len(profile_skills)}): {sorted(profile_skills)[:10]}...")
-        logger.debug(f"Job requires ({len(job_skills)}): {sorted(job_skills)}")
+        logger.debug(f"Required skill groups ({len(groups)}): {groups}")
         
-        if not job_skills:
-            # No skills specified in job, give neutral score
+        if not groups:
             logger.debug("No skills required by job, returning neutral 70")
             return 70.0, [], [], {"note": "No skills required"}
-            
-        # Exact matches
-        exact_matches = profile_skills & job_skills
-        missing = job_skills - profile_skills
-        
-        # Compute exact match ratio (0 to 1)
-        exact_ratio = len(exact_matches) / len(job_skills)
-        details["exact_matches"] = len(exact_matches)
-        details["total_required"] = len(job_skills)
+
+        matched: List[str] = []
+        missing: List[str] = []
+        satisfied = 0
+        unsatisfied_groups = []
+        for group in groups:
+            hits = [skill for skill in group if skill in profile_skills]
+            if hits:
+                satisfied += 1
+                for skill in hits:
+                    if skill not in matched:
+                        matched.append(skill)
+            else:
+                unsatisfied_groups.append(group)
+                # Alternatives of one unsatisfied group, not independent ANDs.
+                for skill in group:
+                    if skill not in missing:
+                        missing.append(skill)
+
+        exact_ratio = satisfied / len(groups)
+        details["exact_matches"] = satisfied
+        details["total_required"] = len(groups)
         details["exact_ratio"] = exact_ratio
+        details["required_groups"] = groups
+        details["unsatisfied_groups"] = unsatisfied_groups
         
         # Semantic similarity for skills text (for partial/related matches)
         semantic_sim = 0.3  # Default low
@@ -269,7 +285,7 @@ class MatchingEngine:
         details["semantic_sim"] = semantic_sim
         
         # Scoring strategy
-        if len(exact_matches) == 0:
+        if satisfied == 0:
             # NO exact skill matches - poor fit regardless of semantic similarity
             # Cap at 50 max (can't be a good fit without matching skills)
             score = semantic_sim * 50
@@ -286,14 +302,16 @@ class MatchingEngine:
             logger.debug(f"Skill score: ({exact_ratio:.2f} x 100) x 0.7 + ({semantic_sim:.2f} x 30) = {score:.1f}")
         
         if settings.log_scoring_details:
-            logger.info(f"  SKILL MATCH: {len(exact_matches)}/{len(job_skills)} exact = {score:.1f}")
-            logger.info(f"    Matched: {sorted(exact_matches)}")
+            logger.info(f"  SKILL MATCH: {satisfied}/{len(groups)} groups = {score:.1f}")
+            logger.info(f"    Groups: {groups}")
+            logger.info(f"    Preferred excluded: {job_chunks.preferred_skills_list}")
+            logger.info(f"    Matched: {sorted(matched)}")
             logger.info(f"    Missing: {sorted(missing)}")
         
         return (
             min(100, max(0, score)),
-            sorted(list(exact_matches)),
-            sorted(list(missing)),
+            sorted(matched),
+            sorted(missing),
             details
         )
     
@@ -388,21 +406,20 @@ class MatchingEngine:
         self,
         profile_chunks: ProfileChunks,
         job_chunks: JobChunks,
-        profile_edu_emb: Optional[np.ndarray],
+        profile_evidence_emb: Optional[np.ndarray],
         job_qual_emb: Optional[np.ndarray]
     ) -> Tuple[float, Dict[str, str]]:
         """
-        Compute requirements fit (education, certifications, etc.).
+        Compare candidate qualification evidence to required job qualifications.
         """
         analysis = {}
         score = 60.0  # Default neutral
         
-        # Semantic similarity of education to qualifications
-        if profile_edu_emb is not None and job_qual_emb is not None:
-            if np.any(profile_edu_emb) and np.any(job_qual_emb):
-                sim = self.embedder.similarity(profile_edu_emb, job_qual_emb)
+        if profile_evidence_emb is not None and job_qual_emb is not None:
+            if np.any(profile_evidence_emb) and np.any(job_qual_emb):
+                sim = self.embedder.similarity(profile_evidence_emb, job_qual_emb)
                 score = ((sim + 1) / 2) * 100
-                analysis["education_sim"] = f"{sim:.3f}"
+                analysis["qualification_sim"] = f"{sim:.3f}"
         
         if settings.log_scoring_details:
             logger.info(f"  REQUIREMENTS: score={score:.1f}")
@@ -439,19 +456,30 @@ class MatchingEngine:
         strengths = []
         gaps = []
         
-        # Skill-based insights
+        # Skill-based insights (group counts, not flattened alternatives)
+        groups = _skill_groups(job_chunks)
+        satisfied_groups = sum(
+            1 for group in groups if any(s in matched_skills for s in group)
+        )
         if matched_skills:
             top_skills = matched_skills[:5]
             strengths.append(f"Strong skill match: {', '.join(top_skills)}")
             
-        if len(matched_skills) >= len(job_chunks.required_skills_list) * 0.7:
-            strengths.append(f"Matches {len(matched_skills)} of {len(job_chunks.required_skills_list)} required skills")
-        elif len(matched_skills) == 0 and len(job_chunks.required_skills_list) > 0:
-            gaps.append(f"No matching skills from {len(job_chunks.required_skills_list)} required")
+        if groups and satisfied_groups >= len(groups) * 0.7:
+            strengths.append(f"Satisfies {satisfied_groups} of {len(groups)} required skill groups")
+        elif groups and satisfied_groups == 0:
+            gaps.append(f"No matching skills from {len(groups)} required skill groups")
             
         if missing_skills:
             top_missing = missing_skills[:3]
             gaps.append(f"Missing skills: {', '.join(top_missing)}")
+
+        profile_skill_set = set(s.lower() for s in profile_chunks.skills_list)
+        preferred_gaps = [
+            s for s in job_chunks.preferred_skills_list if s not in profile_skill_set
+        ]
+        if preferred_gaps:
+            gaps.append(f"Preferred skill not listed: {preferred_gaps[0]}")
             
         # Experience-based insights
         if experience_score >= 70:
@@ -476,6 +504,13 @@ class MatchingEngine:
             
         # Limit to top insights
         return strengths[:5], gaps[:4]
+
+
+def _skill_groups(job_chunks: JobChunks) -> List[List[str]]:
+    """Required groups, falling back to singletons for pre-group stored chunks."""
+    if getattr(job_chunks, "required_skill_groups", None):
+        return job_chunks.required_skill_groups
+    return [[s.lower()] for s in job_chunks.required_skills_list]
 
 
 # Global engine instance

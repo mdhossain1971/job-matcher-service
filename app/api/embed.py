@@ -6,14 +6,64 @@ import time
 import logging
 
 from app.models.schemas import (
-    ProfileEmbedRequest, JobEmbedRequest, EmbedResponse, ErrorResponse
+    ProfileEmbedRequest, JobEmbedRequest, EmbedResponse, ErrorResponse,
+    SimilarityRequest, SimilarityResult
 )
+from app.models.embedder import get_embedding_model
 from app.processors.matcher import get_matching_engine
 from app.storage.memory import get_storage
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/embed", tags=["Embedding"])
+
+# Generic similarity lives under /api/v1 (not /embed) so callers can rank arbitrary
+# short texts. Registered alongside the embed router in main.py.
+similarity_router = APIRouter(prefix="/api/v1", tags=["Similarity"])
+
+
+@similarity_router.post("/similarity", response_model=SimilarityResult)
+async def similarity(request: SimilarityRequest):
+    """
+    Rank `candidates` against `query` by cosine similarity of sentence embeddings.
+
+    Same embedder + cosine the skill matcher uses, exposed for arbitrary short
+    texts. Used by the auto-apply form filler to match a stored answer to a
+    dropdown's actual option labels when literal matching fails. It only ranks
+    the labels you pass in — it never invents an option.
+    """
+    query = (request.query or "").strip()
+    candidates = [c for c in request.candidates if c is not None]
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+    if not candidates:
+        raise HTTPException(status_code=400, detail="candidates must be a non-empty list")
+
+    embedder = get_embedding_model()
+    if not embedder.is_loaded():
+        embedder.load()
+
+    # Embeddings are L2-normalized, so batch_similarity returns cosine in [-1, 1].
+    query_emb = embedder.encode(query)
+    cand_embs = embedder.encode([c.strip() for c in candidates])
+    sims = embedder.batch_similarity(query_emb, cand_embs)
+    scores = [float(s) for s in sims]
+
+    best_index = max(range(len(scores)), key=lambda i: scores[i])
+    best_score = scores[best_index]
+    second_score = max(
+        (s for i, s in enumerate(scores) if i != best_index),
+        default=0.0,
+    )
+
+    return SimilarityResult(
+        best_index=best_index,
+        best_candidate=candidates[best_index],
+        best_score=best_score,
+        second_score=second_score,
+        matched=best_score >= request.threshold,
+        scores=scores,
+    )
 
 
 @router.post("/profile", response_model=EmbedResponse)

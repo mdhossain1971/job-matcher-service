@@ -156,6 +156,30 @@ class InlineMatchRequest(BaseModel):
     job: JobEmbedRequest
 
 
+class SimilarityRequest(BaseModel):
+    """Generic semantic-similarity request: rank `candidates` against `query`.
+
+    Reuses the same embedder primitives the skill-matcher uses internally
+    (encode + cosine), but for arbitrary short texts (e.g. a stored answer vs
+    a dropdown's option labels)."""
+    query: str
+    candidates: List[str]
+    threshold: float = 0.0  # caller decides what counts as a match
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "query": "I am not a protected veteran",
+                "candidates": [
+                    "I identify as one or more of the classifications of protected veterans",
+                    "I am not a veteran.",
+                    "I do not wish to self-identify."
+                ],
+                "threshold": 0.6
+            }
+        }
+
+
 # ============================================
 # Output Models
 # ============================================
@@ -211,6 +235,16 @@ class EmbedResponse(BaseModel):
     processing_time_ms: int
     success: bool = True
     message: Optional[str] = None
+
+
+class SimilarityResult(BaseModel):
+    """Result of ranking candidates against a query by cosine similarity."""
+    best_index: int = Field(..., description="Index of the best-matching candidate, or -1 if none")
+    best_candidate: Optional[str] = Field(None, description="Text of the best-matching candidate")
+    best_score: float = Field(..., description="Cosine similarity (0-1) of the best candidate")
+    second_score: float = Field(0.0, description="Cosine similarity of the runner-up (0 if <2 candidates)")
+    matched: bool = Field(..., description="True if best_score >= threshold")
+    scores: List[float] = Field(default_factory=list, description="Cosine similarity per candidate (input order)")
 
 
 class BatchMatchResult(BaseModel):
