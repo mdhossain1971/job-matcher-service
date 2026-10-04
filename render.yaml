@@ -5,7 +5,6 @@ services:
     branch: main
     plan: standard
     region: oregon
-    healthCheckPath: /health
     dockerfilePath: ./Dockerfile
     dockerContext: .
     envVars:
