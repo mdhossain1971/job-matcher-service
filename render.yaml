@@ -1,0 +1,13 @@
+services:
+  - type: pserv
+    name: job-matcher
+    runtime: docker
+    branch: main
+    plan: standard
+    region: oregon
+    healthCheckPath: /health
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    envVars:
+      - key: DEBUG
+        value: "false"
