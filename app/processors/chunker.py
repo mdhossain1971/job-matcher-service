@@ -331,7 +331,10 @@ class DocumentChunker:
         
         # Extract years required
         combined_text = f"{requirements} {description}"
-        chunks.years_required = self.processor.extract_years_experience(combined_text)
+        normalized = normalize_jd_text(combined_text)
+        sections = split_required_preferred(normalized)
+        years_source = sections.required_text if sections.required_text else normalized
+        chunks.years_required = self.processor.extract_required_years(years_source)
         
         return chunks
     

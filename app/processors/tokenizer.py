@@ -242,7 +242,19 @@ class TextProcessor:
                 return int(match.group(1))
                 
         return None
-    
+
+    def extract_required_years(self, text: str) -> Optional[int]:
+        """
+        Years the candidate must have for this job.
+
+        Company history is ignored. A preferred clause is ignored. An overall
+        bar beats a specialized subset ("8 years software development, including
+        3 years Java" is 8). Alternatives joined by "or" qualify at the lower
+        number. Several mandatory overall bars use the higher one. Profile
+        extraction stays on extract_years_experience.
+        """
+        return _required_years(text)
+
     def clean_text(self, text: str) -> str:
         """
         Clean and normalize text.
@@ -354,3 +366,85 @@ def get_text_processor(model_name: str = "en_core_web_sm") -> TextProcessor:
         _text_processor = TextProcessor(model_name)
         
     return _text_processor
+
+
+_YEAR_SPAN = re.compile(r"(?P<num>\d+)\s*(?:\+|plus)?\s*(?:years?|yrs?)\b", re.IGNORECASE)
+_PREFERRED_CLAUSE = re.compile(
+    r"\b(?:preferred|preferably|ideally|nice to have|nice-to-have|bonus)\b",
+    re.IGNORECASE,
+)
+_HISTORY_SPAN = re.compile(
+    r"\b(?:more than|over)\s+\d+\+?\s*(?:years?|yrs?)\b|\b\d+\s*(?:years?|yrs?)\s+ago\b",
+    re.IGNORECASE,
+)
+_CANDIDATE_REQUIREMENT = re.compile(
+    r"\b(?:experience|exp|required|must|you|your)\b",
+    re.IGNORECASE,
+)
+_SKILL_TAIL = re.compile(r"\b(?:with|in|of)\s+([A-Za-z][\w+#.]*)", re.IGNORECASE)
+_NOT_A_SKILL = {"experience", "exp", "relevant", "professional", "industry", "software", "work"}
+
+
+def _is_company_history(sentence: str) -> bool:
+    if not _HISTORY_SPAN.search(sentence):
+        return False
+    return _CANDIDATE_REQUIREMENT.search(sentence) is None
+
+
+def _is_skill_tail(tail: str) -> bool:
+    match = _SKILL_TAIL.search(tail)
+    if not match:
+        return False
+    return match.group(1).lower() not in _NOT_A_SKILL
+
+
+def _year_bars(part: str):
+    overall = []
+    specialized = []
+    for match in _YEAR_SPAN.finditer(part):
+        prefix = part[max(0, match.start() - 40):match.start()]
+        tail = part[match.end():match.end() + 60]
+        if _PREFERRED_CLAUSE.search(prefix + " " + tail):
+            continue
+        number = int(match.group("num"))
+        if re.search(r"\bincluding\b", prefix, re.IGNORECASE) or _is_skill_tail(tail):
+            specialized.append(number)
+        else:
+            overall.append(number)
+    return overall, specialized
+
+
+def _required_years(text: str):
+    if not text:
+        return None
+    normalized = text.replace("\u2019", "'").replace("\u2018", "'")
+    sentences = re.split(r"[\n;]+|(?<=[.!?])\s+", normalized)
+    overall_bars = []
+    alternative_bars = []
+    specialized_bars = []
+    for sentence in sentences:
+        if _is_company_history(sentence):
+            continue
+        parts = re.split(r"\bor\b", sentence, flags=re.IGNORECASE)
+        classified = []
+        for part in parts:
+            overall, specialized = _year_bars(part)
+            if overall:
+                classified.append(("overall", max(overall)))
+            elif specialized:
+                classified.append(("specialized", max(specialized)))
+        if not classified:
+            continue
+        if len(parts) > 1 and len(classified) > 1:
+            alternative_bars.append(min(value for _, value in classified))
+        elif classified[0][0] == "overall":
+            overall_bars.append(classified[0][1])
+        else:
+            specialized_bars.append(classified[0][1])
+    if overall_bars:
+        return max(overall_bars)
+    if alternative_bars:
+        return max(alternative_bars)
+    if specialized_bars:
+        return max(specialized_bars)
+    return None
