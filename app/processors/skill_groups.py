@@ -25,6 +25,7 @@ PREFERRED_HEADERS = (
 # (Palo Alto and many others). Match as a full line only, never as a substring
 # of "Preferred Qualifications".
 REQUIRED_HEADERS = (
+    "minimum requirements",
     "minimum qualifications",
     "required qualifications",
     "required skills",

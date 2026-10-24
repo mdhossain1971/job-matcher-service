@@ -114,6 +114,20 @@ class GroupParseTests(unittest.TestCase):
         required_flat = {s for g in required_groups for s in g}
         self.assertNotIn("kubernetes", required_flat)
 
+    def test_minimum_requirements_is_required_text(self):
+        jd = (
+            "About the team\n"
+            "Minimum requirements\n"
+            "5+ years of Java\n"
+            "Preferred qualifications\n"
+            "Kubernetes\n"
+        )
+        split = split_required_preferred(normalize_jd_text(jd))
+        self.assertTrue(split.found_required_header)
+        self.assertIn("java", split.required_text.lower())
+        self.assertNotIn("kubernetes", split.required_text.lower())
+        self.assertIn("kubernetes", split.preferred_text.lower())
+
 
 class SkillMatchSemanticsTests(unittest.TestCase):
     def test_1_language_or_group_java_satisfies(self):
